@@ -24,6 +24,10 @@ import { existsSync, writeFileSync, mkdirSync, readFileSync, openSync, readdirSy
 import { resolve, dirname } from "path";
 import { homedir } from "os";
 import { createServer as netCreateServer } from "net";
+import { randomUUID } from "crypto";
+
+// 每个 MCP server 进程（即每个 CC 窗口）生成唯一 session ID，确保不同窗口创建独立项目
+const SESSION_ID = randomUUID().slice(0, 8);
 
 // === 配置 ===
 
@@ -733,7 +737,7 @@ server.tool(
       bootstrapCompleted = true;
     }
 
-    const result = await sendChatMessage(message, user_id || "cc-default-user");
+    const result = await sendChatMessage(message, user_id || `cc-${SESSION_ID}`);
 
     const lines: string[] = [result.reply];
     if (result.project_id) {
