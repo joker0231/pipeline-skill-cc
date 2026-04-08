@@ -408,8 +408,34 @@ async function runBootstrap(apiKey: string, model: string, deployPassword?: stri
     }
   }
 
-  // Step 8: 启动 pipeline-service（如果未运行）
-  log("BOOTSTRAP", "Step 8: Starting pipeline-service...");
+  // Step 8: 安装 Playwright chromium（用于预览页面运行时检测）
+  log("BOOTSTRAP", "Step 8: Installing Playwright chromium...");
+
+  // 检查是否已安装（macOS 默认路径）
+  const playwrightCacheDir = resolve(homedir(), "Library/Caches/ms-playwright");
+  const chromiumInstalled = existsSync(playwrightCacheDir) &&
+    fs.readdirSync(playwrightCacheDir).some(f => f.startsWith("chromium-"));
+
+  if (chromiumInstalled) {
+    steps.push("✅ Playwright chromium 已安装（跳过）");
+  } else {
+    try {
+      execFileSync("npx", ["playwright", "install", "chromium"], {
+        cwd: PIPELINE_SERVICE_DIR,
+        timeout: 180_000, // 3分钟超时
+        stdio: "pipe",
+      });
+      steps.push("✅ Playwright chromium 已安装");
+    } catch (e) {
+      const msg = e instanceof Error ? e.message : String(e);
+      // 非致命错误，继续执行
+      steps.push(`⚠️ Playwright chromium 安装失败（非致命）: ${msg}`);
+      log("BOOTSTRAP", `Playwright install failed (non-fatal): ${msg}`);
+    }
+  }
+
+  // Step 9: 启动 pipeline-service（如果未运行）
+  log("BOOTSTRAP", "Step 9: Starting pipeline-service...");
 
   const pipelineReady = await isServiceReady(`${PIPELINE_URL}/api/projects`);
   if (pipelineReady) {
@@ -429,6 +455,7 @@ async function runBootstrap(apiKey: string, model: string, deployPassword?: stri
     const pipelineLogFile = "/tmp/pipeline-service.log";
     const pipelineEnv: Record<string, string> = {
       ALICE_ENGINE_URL: ALICE_ENGINE_URL,
+      PIPELINE_HOST: PIPELINE_URL.replace(/:\d+$/, ''),  // 提取 host 部分
       PIPELINE_PORT: PIPELINE_PORT,
       PIPELINE_WORKSPACE: WORKSPACE_DIR,
     };
@@ -603,6 +630,12 @@ server.tool(
       // 提示可用操作
       lines.push("");
       lines.push("## 可用操作");
+      if (project.status === "writing_preview" || project.status === "chatting") {
+        lines.push("- 使用 `pipeline_chat` 继续对话，提出修改意见");
+        if (project.preview_url) {
+          lines.push(`- 预览地址: ${project.preview_url}`);
+        }
+      }
       if (project.status === "preview_ready") {
         lines.push("- 使用 `pipeline_confirm` 确认需求，推进到 Phase 2");
       }
@@ -643,7 +676,7 @@ server.tool(
         lines.push("");
         lines.push("## 项目列表");
         for (const p of result.data.projects) {
-          const statusIcon = p.status === "done" ? "✅" : p.status === "failed" ? "❌" : p.status === "blocked" ? "⏸️" : p.status === "spec_ready" ? "📋" : p.status === "importing" || p.status === "extracting_spec" ? "📦" : "🔄";
+          const statusIcon = p.status === "done" ? "✅" : p.status === "failed" ? "❌" : p.status === "blocked" ? "⏸️" : p.status === "spec_ready" ? "📋" : p.status === "importing" || p.status === "extracting_spec" ? "📦" : p.status === "writing_preview" ? "✏️" : p.status === "preview_ready" ? "🎨" : "🔄";
           lines.push(`- ${statusIcon} \`${p.id}\` — ${p.status}${p.failed_at_stage ? ` (失败于 ${p.failed_at_stage})` : ""}`);
         }
         lines.push("");
@@ -712,6 +745,14 @@ server.tool(
         const projRes = await callPipelineApi("GET", `/api/projects/${result.project_id}`);
         const project = projRes.data?.project as { status?: string; deploy_url?: string; error_summary?: string; failed_at_stage?: string } | undefined;
         if (project) {
+          if (project.status === "writing_preview") {
+            lines.push("");
+            lines.push(`✏️ **正在编写预览中...**`);
+            if (result.preview_url) {
+              lines.push(`可以在 ${result.preview_url} 查看当前效果。`);
+            }
+            lines.push(`继续和龙虾1对话，提出修改意见。确认需求后告诉我"可以了"。`);
+          }
           if (project.status === "preview_ready") {
             lines.push("");
             lines.push(`🎨 **需求原型已就绪！** 请在 ${PIPELINE_URL}/preview/${result.project_id}/ 查看预览。`);
