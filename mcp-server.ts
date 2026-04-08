@@ -208,7 +208,7 @@ async function sendChatMessage(message: string, userId: string): Promise<ChatRes
       } catch { /* best effort */ }
 
       return {
-        reply: `龙虾1 正在工作中，响应时间超过 ${REQUEST_TIMEOUT_MS / 1000} 秒。这是正常的——它可能正在分析需求或编写预览。`,
+        reply: `流水线正在工作中，响应时间超过 ${REQUEST_TIMEOUT_MS / 1000} 秒。这是正常的——可能正在分析需求或编写预览。`,
         project_id: recoveredProjectId,
       };
     }
@@ -581,7 +581,7 @@ server.tool(
       lines.push(`📊 **监控面板**: ${PIPELINE_URL}/`);
       lines.push("在浏览器打开上述地址，可实时查看流水线运行状态。");
       lines.push("");
-      lines.push("现在可以使用 `pipeline_chat` 与龙虾1对话，开始描述你的产品需求。");
+      lines.push("现在可以使用 `pipeline_chat` 开始描述你的产品需求。");
       bootstrapCompleted = true;
     }
 
@@ -657,11 +657,11 @@ server.tool(
       lines.push("");
       lines.push("## 可用操作");
       if (project.status === "chatting") {
-        lines.push("- 龙虾1 正在和你对话，理解需求中");
+        lines.push("- 流水线正在和你对话，理解需求中");
         lines.push("- 使用 `pipeline_chat` 继续对话");
       }
       if (project.status === "writing_preview") {
-        lines.push("- 龙虾1 正在编写 Spec User 和 Preview 预览页面");
+        lines.push("- 流水线正在编写 Spec User 和 Preview 预览页面");
         lines.push("- 使用 `pipeline_chat` 继续对话，提出修改意见");
         if (project.preview_url) {
           lines.push(`- 预览地址: ${project.preview_url}`);
@@ -787,7 +787,7 @@ server.tool(
       currentProjectId = result.project_id;
     }
 
-    const isTimeout = result.reply.startsWith("龙虾1 正在工作中");
+    const isTimeout = result.reply.startsWith("流水线正在工作中");
     const lines: string[] = [result.reply];
 
     if (result.project_id) {
@@ -796,7 +796,7 @@ server.tool(
 
       if (isTimeout) {
         lines.push("");
-        lines.push("请使用 `pipeline_status` 查看龙虾1的最新进展。当状态变为 `writing_preview` 或 `preview_ready` 时，表示龙虾1已产出结果。");
+        lines.push("请使用 `pipeline_status` 查看流水线的最新进展。当状态变为 `writing_preview` 或 `preview_ready` 时，表示已产出结果。");
       }
 
       // 获取项目状态，智能提示
@@ -810,7 +810,7 @@ server.tool(
             if (result.preview_url) {
               lines.push(`可以在 ${result.preview_url} 查看当前效果。`);
             }
-            lines.push(`继续和龙虾1对话，提出修改意见。确认需求后告诉我"可以了"。`);
+            lines.push(`继续对话提出修改意见。确认需求后告诉我"可以了"。`);
           }
           if (project.status === "preview_ready") {
             lines.push("");
