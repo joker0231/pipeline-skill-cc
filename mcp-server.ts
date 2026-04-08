@@ -49,6 +49,8 @@ const GLOBAL_SETTINGS_PATH = resolve(ALICE_BASE_DIR, "global_settings.json");
 // === 状态 ===
 
 let bootstrapCompleted = false;
+/** 当前会话的 project_id，chat 成功返回时自动记录 */
+let currentProjectId: string | null = null;
 
 // === 工具函数 ===
 
@@ -191,7 +193,24 @@ async function sendChatMessage(message: string, userId: string): Promise<ChatRes
     };
   } catch (err: unknown) {
     if (err instanceof Error && err.name === "AbortError") {
-      return { reply: `[MCP-ERROR] 请求超时（${REQUEST_TIMEOUT_MS / 1000}秒），流水线服务可能正忙` };
+      // 超时后尝试找回 project_id — 项目可能已创建，只是龙虾1还没回复
+      let recoveredProjectId: string | undefined;
+      try {
+        const res = await fetch(`${PIPELINE_URL}/api/projects`, { signal: AbortSignal.timeout(5000) });
+        if (res.ok) {
+          const data = (await res.json()) as { projects?: Array<{ id: string; user_id: string; status: string }> };
+          // 找最近一个属于当前用户的活跃项目
+          const match = data.projects?.find(p =>
+            p.user_id === userId && !["done", "failed"].includes(p.status)
+          );
+          if (match) recoveredProjectId = match.id;
+        }
+      } catch { /* best effort */ }
+
+      return {
+        reply: `龙虾1 正在工作中，响应时间超过 ${REQUEST_TIMEOUT_MS / 1000} 秒。这是正常的——它可能正在分析需求或编写预览。`,
+        project_id: recoveredProjectId,
+      };
     }
     const msg = err instanceof Error ? err.message : String(err);
     return { reply: `[MCP-ERROR] 无法连接流水线服务（${PIPELINE_URL}）: ${msg}` };
@@ -584,7 +603,10 @@ server.tool(
   {
     project_id: z.string().optional().describe("项目ID（可选）。传入则返回项目详情，不传则返回服务健康状态"),
   },
-  async ({ project_id }) => {
+  async (args) => {
+    // 未传 project_id 时，自动使用当前会话的项目
+    const project_id = args.project_id || currentProjectId || undefined;
+
     // 项目级状态查询
     if (project_id) {
       const result = await callPipelineApi("GET", `/api/projects/${project_id}`);
@@ -634,7 +656,12 @@ server.tool(
       // 提示可用操作
       lines.push("");
       lines.push("## 可用操作");
-      if (project.status === "writing_preview" || project.status === "chatting") {
+      if (project.status === "chatting") {
+        lines.push("- 龙虾1 正在和你对话，理解需求中");
+        lines.push("- 使用 `pipeline_chat` 继续对话");
+      }
+      if (project.status === "writing_preview") {
+        lines.push("- 龙虾1 正在编写 Spec User 和 Preview 预览页面");
         lines.push("- 使用 `pipeline_chat` 继续对话，提出修改意见");
         if (project.preview_url) {
           lines.push(`- 预览地址: ${project.preview_url}`);
@@ -648,6 +675,22 @@ server.tool(
       }
       if (project.status === "importing" || project.status === "extracting_spec") {
         lines.push("- ⏳ 反向提取进行中，请稍候...");
+      }
+      // Phase 2-5 自动运行中的状态
+      const autoPhaseStatuses: Record<string, string> = {
+        guard_reviewing: "龙虾2 正在审核 Spec User（Phase 2 需求守卫）",
+        adversarial: "蓝红攻防进行中（Phase 2）",
+        guard_done: "Phase 2 完成，即将进入编码阶段",
+        coding: "龙虾3 正在写代码（Phase 3 编码）",
+        coding_gate: "编码质量门检查中（ESLint + Build）",
+        code_review: "龙虾4 正在做代码审查和测试（Phase 4）",
+        review_gate: "测试门检查中",
+        releasing: "龙虾5 正在部署（Phase 5）",
+      };
+      const autoMsg = autoPhaseStatuses[project.status];
+      if (autoMsg) {
+        lines.push(`- ${autoMsg}`);
+        lines.push("- 流水线正在自动运行，无需人工干预");
       }
       if (project.status === "blocked" || project.status === "failed") {
         lines.push("- 使用 `pipeline_retry` 重试");
@@ -739,10 +782,22 @@ server.tool(
 
     const result = await sendChatMessage(message, user_id || `cc-${SESSION_ID}`);
 
+    // 记录当前会话的 project_id
+    if (result.project_id) {
+      currentProjectId = result.project_id;
+    }
+
+    const isTimeout = result.reply.startsWith("龙虾1 正在工作中");
     const lines: string[] = [result.reply];
+
     if (result.project_id) {
       lines.push("");
       lines.push(`📋 项目ID: \`${result.project_id}\``);
+
+      if (isTimeout) {
+        lines.push("");
+        lines.push("请使用 `pipeline_status` 查看龙虾1的最新进展。当状态变为 `writing_preview` 或 `preview_ready` 时，表示龙虾1已产出结果。");
+      }
 
       // 获取项目状态，智能提示
       try {
@@ -807,9 +862,13 @@ server.tool(
 
 当项目状态为 preview_ready 时调用此工具确认需求。确认后龙虾2将开始审核 Spec User、补充边界case、发散测试用例。`,
   {
-    project_id: z.string().describe("项目ID"),
+    project_id: z.string().optional().describe("项目ID（可选，默认使用当前会话项目）"),
   },
-  async ({ project_id }) => {
+  async (args) => {
+    const project_id = args.project_id || currentProjectId;
+    if (!project_id) {
+      return { content: [{ type: "text" as const, text: "❌ 未指定项目ID，且当前会话没有关联项目。请先使用 `pipeline_chat` 开始对话。" }] };
+    }
     const result = await callPipelineApi("POST", `/api/projects/${project_id}/confirm`, { confirmed: true });
 
     if (!result.ok) {
@@ -843,10 +902,15 @@ server.tool(
 
 返回 align（对齐）、guard（守卫）、adversarial（攻防）、coding（编码）、review（测试）各阶段生成的文件。`,
   {
-    project_id: z.string().describe("项目ID"),
+    project_id: z.string().optional().describe("项目ID（可选，默认使用当前会话项目）"),
     file_path: z.string().optional().describe("文件路径（可选）。传入则读取该文件内容，不传则返回文件列表"),
   },
-  async ({ project_id, file_path }) => {
+  async (args) => {
+    const project_id = args.project_id || currentProjectId;
+    const file_path = args.file_path;
+    if (!project_id) {
+      return { content: [{ type: "text" as const, text: "❌ 未指定项目ID，且当前会话没有关联项目。请先使用 `pipeline_chat` 开始对话。" }] };
+    }
     // 读取具体文件
     if (file_path) {
       const result = await callPipelineApi("GET", `/api/projects/${project_id}/files?path=${encodeURIComponent(file_path)}`);
@@ -926,10 +990,15 @@ server.tool(
 
 当项目状态为 failed 或 blocked 时调用此工具重新启动流水线。可选指定从哪个阶段开始重试。`,
   {
-    project_id: z.string().describe("项目ID"),
+    project_id: z.string().optional().describe("项目ID（可选，默认使用当前会话项目）"),
     target_stage: z.string().optional().describe("目标阶段（可选，如 extracting_schema、guard_reviewing、coding、code_review）"),
   },
-  async ({ project_id, target_stage }) => {
+  async (args) => {
+    const project_id = args.project_id || currentProjectId;
+    const target_stage = args.target_stage;
+    if (!project_id) {
+      return { content: [{ type: "text" as const, text: "❌ 未指定项目ID，且当前会话没有关联项目。请先使用 `pipeline_chat` 开始对话。" }] };
+    }
     const body: Record<string, string> = {};
     if (target_stage) {
       body.target_stage = target_stage;
@@ -1000,6 +1069,12 @@ server.tool(
     }
 
     const data = result.data;
+
+    // 记录当前会话的 project_id
+    if (data.project_id) {
+      currentProjectId = data.project_id;
+    }
+
     const lines: string[] = [];
     lines.push(`✅ 项目导入已启动`);
     lines.push("");
