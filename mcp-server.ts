@@ -20,7 +20,7 @@ import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { z } from "zod";
 import { execFileSync, spawn } from "child_process";
-import { existsSync, writeFileSync, mkdirSync, readFileSync, openSync } from "fs";
+import { existsSync, writeFileSync, mkdirSync, readFileSync, openSync, readdirSync } from "fs";
 import { resolve, dirname } from "path";
 import { homedir } from "os";
 import { createServer as netCreateServer } from "net";
@@ -414,7 +414,7 @@ async function runBootstrap(apiKey: string, model: string, deployPassword?: stri
   // 检查是否已安装（macOS 默认路径）
   const playwrightCacheDir = resolve(homedir(), "Library/Caches/ms-playwright");
   const chromiumInstalled = existsSync(playwrightCacheDir) &&
-    fs.readdirSync(playwrightCacheDir).some(f => f.startsWith("chromium-"));
+    readdirSync(playwrightCacheDir).some(f => f.startsWith("chromium-"));
 
   if (chromiumInstalled) {
     steps.push("✅ Playwright chromium 已安装（跳过）");
