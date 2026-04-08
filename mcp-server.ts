@@ -796,7 +796,7 @@ server.tool(
 
       if (isTimeout) {
         lines.push("");
-        lines.push("请使用 `pipeline_status` 查看流水线的最新进展。当状态变为 `writing_preview` 或 `preview_ready` 时，表示已产出结果。");
+        lines.push("流水线正在后台运行，无需反复查询状态。请告知用户耐心等待，如果用户想了解进展可以主动询问。");
       }
 
       // 获取项目状态，智能提示
