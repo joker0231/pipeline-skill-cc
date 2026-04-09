@@ -353,12 +353,23 @@ async function runBootstrap(apiKey: string, model: string, deployPassword?: stri
   writeFileSync(GLOBAL_SETTINGS_PATH, JSON.stringify(settings, null, 2), "utf-8");
   steps.push(`✅ LLM 配置已写入: ${GLOBAL_SETTINGS_PATH}`);
 
-  // Step 5: 安装 pipeline-service 依赖
+  // Step 5: 安装 pipeline-service 依赖（如果目录不存在则自动 clone）
   log("BOOTSTRAP", "Step 5: Installing pipeline-service dependencies...");
 
   if (!existsSync(PIPELINE_SERVICE_DIR)) {
-    errors.push(`❌ pipeline-service 目录不存在: ${PIPELINE_SERVICE_DIR}。请设置 PIPELINE_SERVICE_DIR 环境变量指向正确路径。`);
-    return { success: false, steps, errors };
+    log("BOOTSTRAP", "pipeline-service not found, cloning from GitHub...");
+    try {
+      execFileSync("git", [
+        "clone",
+        "https://github.com/joker0231/pipeline-service.git",
+        PIPELINE_SERVICE_DIR,
+      ], { stdio: "pipe", timeout: 300_000 });
+      steps.push(`✅ pipeline-service 已自动克隆到: ${PIPELINE_SERVICE_DIR}`);
+    } catch (e) {
+      const msg = e instanceof Error ? e.message : String(e);
+      errors.push(`❌ 自动克隆 pipeline-service 失败: ${msg}。请手动执行: git clone https://github.com/joker0231/pipeline-service.git ${PIPELINE_SERVICE_DIR}`);
+      return { success: false, steps, errors };
+    }
   }
 
   try {
@@ -596,10 +607,15 @@ server.tool(
 
 server.tool(
   "pipeline_status",
-  `检查流水线状态。
+  `检查流水线状态。仅在用户明确要求查看状态时调用。
 
 - 不传 project_id：返回服务健康状态（Alice 引擎 + 流水线服务是否运行）
-- 传 project_id：返回该项目的详细状态（阶段、进度、错误信息、部署URL等）`,
+- 传 project_id：返回该项目的详细状态（阶段、进度、错误信息、部署URL等）
+
+⚠️ 禁止自动轮询：
+- 不要自动或反复调用此工具，只有用户主动问"流水线怎么样了"才调用
+- 调用后把结果返回给用户，然后停下来等待用户下一步指令
+- 不要根据返回结果自动调用 pipeline_chat、pipeline_artifacts 等其他工具`,
   {
     project_id: z.string().optional().describe("项目ID（可选）。传入则返回项目详情，不传则返回服务健康状态"),
   },
@@ -653,28 +669,34 @@ server.tool(
         lines.push(requirement);
       }
 
-      // 提示可用操作
+      // 当前状态说明
       lines.push("");
-      lines.push("## 可用操作");
+      lines.push("## 当前状态");
       if (project.status === "chatting") {
-        lines.push("- 流水线正在和你对话，理解需求中");
-        lines.push("- 使用 `pipeline_chat` 继续对话");
+        if (project.preview_url) {
+          lines.push("- 龙虾1正在工作中，预览已生成");
+          lines.push(`- 预览地址: ${project.preview_url}`);
+        } else {
+          lines.push("- 龙虾1正在理解需求中，请等待其回复");
+        }
       }
       if (project.status === "writing_preview") {
-        lines.push("- 流水线正在编写 Spec User 和 Preview 预览页面");
-        lines.push("- 使用 `pipeline_chat` 继续对话，提出修改意见");
+        lines.push("- 龙虾1正在编写 Spec User 和 Preview 预览页面，请耐心等待");
         if (project.preview_url) {
           lines.push(`- 预览地址: ${project.preview_url}`);
         }
       }
       if (project.status === "preview_ready") {
-        lines.push("- 使用 `pipeline_confirm` 确认需求，推进到 Phase 2");
+        lines.push("- 需求原型已就绪，等待用户确认");
+        if (project.preview_url) {
+          lines.push(`- 预览地址: ${project.preview_url}`);
+        }
       }
       if (project.status === "spec_ready") {
-        lines.push('- 反向提取完成！使用 `pipeline_chat` 提迭代需求（如"把idle检测频率从10改为5"）');
+        lines.push("- 反向提取完成，可以接受迭代需求");
       }
       if (project.status === "importing" || project.status === "extracting_spec") {
-        lines.push("- ⏳ 反向提取进行中，请稍候...");
+        lines.push("- 反向提取进行中，请稍候...");
       }
       // Phase 2-5 自动运行中的状态
       const autoPhaseStatuses: Record<string, string> = {
@@ -693,9 +715,19 @@ server.tool(
         lines.push("- 流水线正在自动运行，无需人工干预");
       }
       if (project.status === "blocked" || project.status === "failed") {
-        lines.push("- 使用 `pipeline_retry` 重试");
+        lines.push("- 可使用 `pipeline_retry` 重试（需要用户确认）");
       }
-      lines.push("- 使用 `pipeline_artifacts` 查看阶段产物");
+      if (project.status === "done") {
+        if (project.deploy_url) {
+          lines.push(`- 已完成！部署地址: ${project.deploy_url}`);
+        } else {
+          lines.push("- 流水线已完成");
+        }
+      }
+
+      // 反轮询指令
+      lines.push("");
+      lines.push("⚠️ 请将以上状态信息返回给用户，然后停下来等待用户的下一步指令。不要自动调用任何其他工具。");
 
       return {
         content: [{ type: "text" as const, text: lines.join("\n") }],
@@ -726,10 +758,11 @@ server.tool(
           const statusIcon = p.status === "done" ? "✅" : p.status === "failed" ? "❌" : p.status === "blocked" ? "⏸️" : p.status === "spec_ready" ? "📋" : p.status === "importing" || p.status === "extracting_spec" ? "📦" : p.status === "writing_preview" ? "✏️" : p.status === "preview_ready" ? "🎨" : "🔄";
           lines.push(`- ${statusIcon} \`${p.id}\` — ${p.status}${p.failed_at_stage ? ` (失败于 ${p.failed_at_stage})` : ""}`);
         }
-        lines.push("");
-        lines.push("如需查看某个项目的详情，告诉我项目ID即可。");
       }
     }
+
+    lines.push("");
+    lines.push("⚠️ 请将以上信息返回给用户，然后停下来等待用户的下一步指令。不要自动调用任何其他工具。");
 
     return {
       content: [{ type: "text" as const, text: lines.join("\n") }],
@@ -760,7 +793,12 @@ server.tool(
 
 ⚠️ 首次使用前需先调用 pipeline_bootstrap 初始化环境。如果返回"未就绪"，请先调用 pipeline_bootstrap。
 
-返回内容包含 project_id，后续可用 pipeline_status/pipeline_confirm/pipeline_retry 等工具。`,
+⚠️ 禁止自动调用：
+- 调用此工具后，不要自动调用 pipeline_status 或 pipeline_artifacts 去"检查结果"
+- 不要因为 pipeline_status 返回 "chatting" 就自动调用此工具
+- 不要因为 pipeline_artifacts 返回空结果就重发用户消息
+- 只有用户主动说了新的话，才使用此工具转发
+- 调用一次后，把结果返回给用户，然后停下来等待用户下一步指令`,
   {
     message: z.string().describe("用户的消息内容（自然语言描述需求、回答问题、确认方案等）"),
     user_id: z.string().optional().describe("用户标识，用于保持对话上下文（可选，默认 cc-default-user）"),
@@ -808,19 +846,17 @@ server.tool(
             lines.push("");
             lines.push(`✏️ **正在编写预览中...**`);
             if (result.preview_url) {
-              lines.push(`可以在 ${result.preview_url} 查看当前效果。`);
+              lines.push(`预览地址: ${result.preview_url}`);
             }
-            lines.push(`继续对话提出修改意见。确认需求后告诉我"可以了"。`);
           }
           if (project.status === "preview_ready") {
             lines.push("");
-            lines.push(`🎨 **需求原型已就绪！** 请在 ${PIPELINE_URL}/preview/${result.project_id}/ 查看预览。`);
-            lines.push(`确认无误后，使用 \`pipeline_confirm\` 或告诉我"确认需求"推进到下一阶段。`);
+            lines.push(`🎨 **需求原型已就绪！**`);
+            lines.push(`预览地址: ${PIPELINE_URL}/preview/${result.project_id}/`);
           }
           if (project.status === "spec_ready") {
             lines.push("");
-            lines.push(`📋 **Spec User 已就绪！** 反向提取完成，已生成分模块的结构化描述。`);
-            lines.push(`现在可以直接描述你的迭代需求（如"把idle检测频率从10改为5"），流水线会定位相关模块并开始开发。`);
+            lines.push(`📋 **Spec User 已就绪！** 反向提取完成。`);
           }
           if (project.status === "done" && project.deploy_url) {
             lines.push("");
@@ -832,12 +868,10 @@ server.tool(
           if (project.status === "blocked") {
             lines.push("");
             lines.push(`⏸️ **流水线遇到瓶颈**，阶段: ${project.failed_at_stage || "未知"}。${project.error_summary ? `原因: ${project.error_summary}` : ""}`);
-            lines.push(`使用 \`pipeline_retry\` 或告诉我"重试"来恢复流水线。`);
           }
           if (project.status === "failed") {
             lines.push("");
             lines.push(`❌ **流水线失败**，阶段: ${project.failed_at_stage || "未知"}。${project.error_summary ? `原因: ${project.error_summary}` : ""}`);
-            lines.push(`使用 \`pipeline_retry\` 或告诉我"重试"来重新启动。`);
           }
         }
       } catch {
@@ -847,6 +881,9 @@ server.tool(
     if (result.preview_url) {
       lines.push(`🔗 预览: ${result.preview_url}`);
     }
+
+    lines.push("");
+    lines.push("⚠️ 请将以上信息返回给用户，然后停下来等待用户的下一步指令。不要自动调用 pipeline_status、pipeline_artifacts 或任何其他工具。");
 
     return {
       content: [{ type: "text" as const, text: lines.join("\n") }],
@@ -898,9 +935,14 @@ server.tool(
 
 server.tool(
   "pipeline_artifacts",
-  `查看项目各阶段的产物文件列表。
+  `查看项目各阶段的产物文件列表。仅在用户明确要求查看产物时调用。
 
-返回 align（对齐）、guard（守卫）、adversarial（攻防）、coding（编码）、review（测试）各阶段生成的文件。`,
+返回 align（对齐）、guard（守卫）、adversarial（攻防）、coding（编码）、review（测试）各阶段生成的文件。
+
+⚠️ 禁止自动调用：
+- 不要自动调用此工具，只有用户主动要求查看产物时才调用
+- 如果产物为空，这是正常的（流水线还在工作中），不要尝试调用其他工具来"修复"
+- 调用后把结果返回给用户，然后停下来等待用户的下一步指令`,
   {
     project_id: z.string().optional().describe("项目ID（可选，默认使用当前会话项目）"),
     file_path: z.string().optional().describe("文件路径（可选）。传入则读取该文件内容，不传则返回文件列表"),
@@ -970,11 +1012,23 @@ server.tool(
 
     if (totalFiles === 0) {
       lines.push("");
-      lines.push("暂无产物文件。");
+      // 查询项目状态，给出上下文
+      const projResult = await callPipelineApi("GET", `/api/projects/${project_id}`);
+      const projStatus = projResult.data?.project?.status;
+      if (projStatus === "chatting" || projStatus === "writing_preview") {
+        lines.push("暂无产物文件。Phase 1（需求对齐）仍在进行中，龙虾1完成编写后产物才会出现。这是正常的，请告知用户耐心等待。");
+      } else if (projStatus === "importing" || projStatus === "extracting_spec") {
+        lines.push("暂无产物文件。反向提取正在进行中，完成后产物才会出现。");
+      } else {
+        lines.push("暂无产物文件。");
+      }
     } else {
       lines.push("");
-      lines.push(`共 ${totalFiles} 个文件。使用 \`pipeline_artifacts\` 传入 file_path 查看文件内容。`);
+      lines.push(`共 ${totalFiles} 个文件。`);
     }
+
+    lines.push("");
+    lines.push("⚠️ 请将以上信息返回给用户，然后停下来等待用户的下一步指令。不要自动调用任何其他工具。");
 
     return {
       content: [{ type: "text" as const, text: lines.join("\n") }],
