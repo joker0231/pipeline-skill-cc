@@ -924,6 +924,8 @@ server.tool(
     lines.push("4. 蓝红攻防验证");
     lines.push("");
     lines.push("流水线正在自动运行中，完成后会通知你。");
+    lines.push("");
+    lines.push("⚠️ 请将以上信息返回给用户，然后停下来等待用户的下一步指令。不要自动调用 pipeline_status 或其他工具去轮询进度。");
 
     return {
       content: [{ type: "text" as const, text: lines.join("\n") }],
