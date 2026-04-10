@@ -164,9 +164,82 @@ interface ChatResult {
   preview_url?: string;
 }
 
+/**
+ * 轮询等待龙虾1回复
+ *
+ * chat API 异步返回后，通过 GET /api/projects/:id 轮询 message_logs，
+ * 找到比 knownMsgCount 更多的 alice 消息时返回新增内容。
+ *
+ * 退出条件：
+ * 1. 有新的 alice 回复
+ * 2. 项目状态离开 chatting/writing_preview（进入后续阶段或出错）
+ * 3. 超时（默认 3 分钟）
+ */
+async function pollForAgentReply(
+  projectId: string,
+  knownMsgCount: number,
+): Promise<{ reply: string; preview_url?: string } | null> {
+  const POLL_INTERVAL_MS = 20_000; // 20 秒
+  const MAX_POLLS = 9; // 20s * 9 = 180s = 3 分钟
+
+  for (let i = 0; i < MAX_POLLS; i++) {
+    await new Promise(r => setTimeout(r, POLL_INTERVAL_MS));
+
+    try {
+      const res = await callPipelineApi("GET", `/api/projects/${projectId}`);
+      if (!res.ok || !res.data) continue;
+
+      const project = res.data.project as { status?: string; preview_url?: string } | undefined;
+      const messages = (res.data.messages || []) as Array<{ direction: string; source: string; content: string | null }>;
+
+      // 统计当前 alice inbound 消息数
+      const aliceMessages = messages.filter(
+        (m: { direction: string; source: string; content: string | null }) =>
+          m.direction === "inbound" && m.source === "alice" && m.content
+      );
+
+      if (aliceMessages.length > knownMsgCount) {
+        // 拼接所有新增消息
+        const newMessages = aliceMessages.slice(knownMsgCount);
+        const reply = newMessages.map((m: { content: string | null }) => m.content).join("\n\n---\n\n");
+        return { reply, preview_url: project?.preview_url || undefined };
+      }
+
+      // 项目状态已离开对话阶段，不用继续等
+      const status = project?.status;
+      if (status && !["chatting", "writing_preview"].includes(status)) {
+        log("CHAT", `Project ${projectId} status=${status}, stop polling`);
+        if (status === "preview_ready") {
+          return { reply: `需求原型已就绪！预览地址: ${PIPELINE_URL}/preview/${projectId}/`, preview_url: project?.preview_url || `${PIPELINE_URL}/preview/${projectId}/` };
+        }
+        return null; // 状态变了但没有新消息，返回 null
+      }
+    } catch {
+      // 网络错误，继续轮询
+    }
+  }
+
+  log("CHAT", `Poll timeout for project ${projectId} after ${MAX_POLLS} polls`);
+  return null;
+}
+
 async function sendChatMessage(message: string, userId: string): Promise<ChatResult> {
+  // 先统计已有的 alice 消息数（用于后续轮询判断新增）
+  let knownAliceMsgCount = 0;
+  if (currentProjectId) {
+    try {
+      const res = await callPipelineApi("GET", `/api/projects/${currentProjectId}`);
+      if (res.ok && res.data?.messages) {
+        knownAliceMsgCount = (res.data.messages as Array<{ direction: string; source: string; content: string | null }>)
+          .filter((m: { direction: string; source: string; content: string | null }) =>
+            m.direction === "inbound" && m.source === "alice" && m.content
+          ).length;
+      }
+    } catch { /* best effort */ }
+  }
+
   const controller = new AbortController();
-  const timeout = setTimeout(() => controller.abort(), REQUEST_TIMEOUT_MS);
+  const timeout = setTimeout(() => controller.abort(), 30_000); // chat API 现在是异步的，30s 足够
 
   try {
     const res = await fetch(`${PIPELINE_URL}/api/chat`, {
@@ -186,30 +259,52 @@ async function sendChatMessage(message: string, userId: string): Promise<ChatRes
     }
 
     const data = (await res.json()) as { reply?: string; error?: string; project_id?: string; preview_url?: string };
+    const projectId = data.project_id || currentProjectId;
+
+    // 如果 API 直接返回了回复（同步状态查询等），直接用
+    if (data.reply) {
+      return {
+        reply: data.reply,
+        project_id: data.project_id,
+        preview_url: data.preview_url,
+      };
+    }
+
+    // 异步模式：reply 为 null，轮询等待龙虾1回复
+    if (projectId) {
+      // 新项目时重新获取已有消息数
+      if (data.project_id && data.project_id !== currentProjectId) {
+        knownAliceMsgCount = 0;
+      }
+
+      log("CHAT", `Async mode, polling for reply | project=${projectId} | knownMsgs=${knownAliceMsgCount}`);
+      const pollResult = await pollForAgentReply(projectId, knownAliceMsgCount);
+
+      if (pollResult) {
+        return {
+          reply: pollResult.reply,
+          project_id: data.project_id,
+          preview_url: pollResult.preview_url || data.preview_url,
+        };
+      }
+
+      // 轮询超时，返回提示
+      return {
+        reply: "龙虾1正在思考中，请稍后使用 pipeline_status 查看最新进展。",
+        project_id: data.project_id,
+        preview_url: data.preview_url,
+      };
+    }
+
     return {
-      reply: data.reply || data.error || "流水线服务返回了空回复",
+      reply: data.error || "流水线服务返回了空回复",
       project_id: data.project_id,
-      preview_url: data.preview_url,
     };
   } catch (err: unknown) {
     if (err instanceof Error && err.name === "AbortError") {
-      // 超时后尝试找回 project_id — 项目可能已创建，只是龙虾1还没回复
-      let recoveredProjectId: string | undefined;
-      try {
-        const res = await fetch(`${PIPELINE_URL}/api/projects`, { signal: AbortSignal.timeout(5000) });
-        if (res.ok) {
-          const data = (await res.json()) as { projects?: Array<{ id: string; user_id: string; status: string }> };
-          // 找最近一个属于当前用户的活跃项目
-          const match = data.projects?.find(p =>
-            p.user_id === userId && !["done", "failed"].includes(p.status)
-          );
-          if (match) recoveredProjectId = match.id;
-        }
-      } catch { /* best effort */ }
-
       return {
-        reply: `流水线正在工作中，响应时间超过 ${REQUEST_TIMEOUT_MS / 1000} 秒。这是正常的——可能正在分析需求或编写预览。`,
-        project_id: recoveredProjectId,
+        reply: `请求超时，流水线可能正在处理中。`,
+        project_id: currentProjectId || undefined,
       };
     }
     const msg = err instanceof Error ? err.message : String(err);
